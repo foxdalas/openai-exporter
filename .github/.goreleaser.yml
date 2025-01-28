@@ -1,0 +1,40 @@
+project_name: openai-exporter
+release:
+  github:
+    owner: foxdalas
+    name: openai-exporter
+
+builds:
+  - id: openai-exporter
+    binary: openai-exporter
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+dockers:
+  - id: openai-exporter-docker-amd64
+    goos: linux
+    goarch: amd64
+    ids:
+      - openai-exporter
+    image_templates:
+      - "foxdalas/openai-exporter:v{{ .Version }}-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    use: buildx
+  - id: openai-exporter-docker-arm64
+    goos: linux
+    goarch: arm64
+    ids:
+      - openai-exporter
+    image_templates:
+      - "foxdalas/openai-exporter:v{{ .Version }}-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    use: buildx
+docker_manifests:
+  - name_template: foxdalas/openai-exporter:v{{ .Version }}
+    image_templates:
+      - foxdalas/openai-exporter:v{{ .Version }}-amd64
+      - foxdalas/openai-exporter:v{{ .Version }}-arm64
