@@ -7,4 +7,4 @@ RUN apk add --no-cache ca-certificates
 COPY openai-exporter /bin/openai_exporter
 
 ENTRYPOINT ["/bin/openai_exporter"]
-EXPOSE     9100
+EXPOSE     9185

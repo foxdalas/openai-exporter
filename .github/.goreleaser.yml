@@ -1,3 +1,4 @@
+version: 2
 project_name: openai-exporter
 release:
   github:
@@ -12,6 +13,8 @@ builds:
     goarch:
       - amd64
       - arm64
+    env:
+      - CGO_ENABLED=0
 dockers:
   - id: openai-exporter-docker-amd64
     goos: linux
