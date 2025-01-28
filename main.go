@@ -119,29 +119,15 @@ func (e *Exporter) collect() {
 		return
 	}
 
-	// Map to aggregate stats by model
-	modelStats := make(map[string]struct {
-		contextTokens   float64
-		generatedTokens float64
-	})
-
-	// Aggregate data by model
+	// Update Prometheus metrics
 	for _, data := range usage.Data {
 		model := data.Model
 		if model == "" {
 			model = "unknown"
 		}
 
-		stats := modelStats[model]
-		stats.contextTokens += float64(data.ContextTokens)
-		stats.generatedTokens += float64(data.GeneratedTokens)
-		modelStats[model] = stats
-	}
-
-	// Update Prometheus metrics
-	for model, stats := range modelStats {
-		contextTokensTotal.WithLabelValues(model, e.orgID, e.projectID).Add(stats.contextTokens)
-		generatedTokensTotal.WithLabelValues(model, e.orgID, e.projectID).Add(stats.generatedTokens)
+		contextTokensTotal.WithLabelValues(model, e.orgID, e.projectID).Add(float64(data.ContextTokens))
+		generatedTokensTotal.WithLabelValues(model, e.orgID, e.projectID).Add(float64(data.GeneratedTokens))
 	}
 }
 
