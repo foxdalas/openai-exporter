@@ -27,20 +27,20 @@ type Usage struct {
 
 // Prometheus metrics
 var (
-	// Counter for context tokens
-	contextTokensTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "openai_context_tokens_total",
-			Help: "Total number of context tokens used",
+	// Gauge for context tokens
+	contextTokens = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "openai_context_tokens",
+			Help: "Number of context tokens used today",
 		},
 		[]string{"model", "organization_id", "project_id"},
 	)
 
-	// Counter for generated tokens
-	generatedTokensTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "openai_generated_tokens_total",
-			Help: "Total number of generated tokens used",
+	// Gauge for generated tokens
+	generatedTokens = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "openai_generated_tokens",
+			Help: "Number of generated tokens used today",
 		},
 		[]string{"model", "organization_id", "project_id"},
 	)
@@ -48,8 +48,8 @@ var (
 
 func init() {
 	// Register Prometheus metrics
-	prometheus.MustRegister(contextTokensTotal)
-	prometheus.MustRegister(generatedTokensTotal)
+	prometheus.MustRegister(contextTokens)
+	prometheus.MustRegister(generatedTokens)
 }
 
 // Exporter handles metrics collection from OpenAI API
@@ -126,8 +126,8 @@ func (e *Exporter) collect() {
 			model = "unknown"
 		}
 
-		contextTokensTotal.WithLabelValues(model, e.orgID, e.projectID).Add(float64(data.ContextTokens))
-		generatedTokensTotal.WithLabelValues(model, e.orgID, e.projectID).Add(float64(data.GeneratedTokens))
+		contextTokens.WithLabelValues(model, e.orgID, e.projectID).Set(float64(data.ContextTokens))
+		generatedTokens.WithLabelValues(model, e.orgID, e.projectID).Set(float64(data.GeneratedTokens))
 	}
 }
 
