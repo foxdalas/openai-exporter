@@ -14,6 +14,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// -------------------------
+// Custom Type for Batch Field
+// -------------------------
+
 // StringOrBool is a custom type that unmarshals a JSON value that may be either a string, a bool, or null.
 // For a boolean value, it converts the value to its string representation ("true" or "false").
 // For a null value, it returns "unknown".
@@ -50,6 +54,21 @@ func (s *StringOrBool) UnmarshalJSON(b []byte) error {
 
 	return fmt.Errorf("unsupported type for StringOrBool: %s", string(b))
 }
+
+// -------------------------
+// Global Variables and State
+// -------------------------
+
+// usageState stores the last seen values for each unique record key (per bucket and token type)
+// to compute the delta between scrapes.
+var (
+	stateMu    sync.Mutex
+	usageState = make(map[string]float64)
+)
+
+// -------------------------
+// Prometheus Metric and CLI Flags
+// -------------------------
 
 // UsageEndpoint represents an API usage endpoint.
 type UsageEndpoint struct {
@@ -108,6 +127,10 @@ func init() {
 	logrus.Info("Metrics registered successfully")
 }
 
+// -------------------------
+// Exporter and API Structures
+// -------------------------
+
 // Exporter holds the HTTP client and credentials for fetching usage data.
 type Exporter struct {
 	client *http.Client
@@ -165,13 +188,70 @@ func NewExporter() (*Exporter, error) {
 	}, nil
 }
 
+// -------------------------
+// Helper Functions for State and Metrics
+// -------------------------
+
+// mergeLabels returns a new map merging base labels with an extra key-value pair.
+func mergeLabels(base prometheus.Labels, key, value string) prometheus.Labels {
+	newLabels := make(prometheus.Labels, len(base)+1)
+	for k, v := range base {
+		newLabels[k] = v
+	}
+	newLabels[key] = value
+	return newLabels
+}
+
+// updateMetric computes the delta for a given token type and bucket,
+// updates the state map, and then adds only the delta to the Prometheus counter.
+// If the record is seen for the first time, it is used as the baseline and NO metric update is performed.
+func updateMetric(labels prometheus.Labels, tokenType string, bucketStart int64, newValue float64) {
+	// Create a composite key that uniquely identifies this record.
+	// The key is composed of:
+	// operation|bucketStart|project_id|user_id|api_key_id|model|batch|token_type
+	compositeKey := fmt.Sprintf("%s|%d|%s|%s|%s|%s|%s|%s",
+		labels["operation"],
+		bucketStart,
+		labels["project_id"],
+		labels["user_id"],
+		labels["api_key_id"],
+		labels["model"],
+		labels["batch"],
+		tokenType,
+	)
+
+	stateMu.Lock()
+	prev, exists := usageState[compositeKey]
+	if !exists {
+		// First time seen: set baseline, do not update the metric.
+		usageState[compositeKey] = newValue
+		stateMu.Unlock()
+		return
+	}
+	delta := newValue - prev
+	// In case the value has decreased (should not happen), use the new value.
+	if delta < 0 {
+		delta = newValue
+	}
+	usageState[compositeKey] = newValue
+	stateMu.Unlock()
+
+	// Update the Prometheus counter only with the delta.
+	tokensTotal.With(mergeLabels(labels, "token_type", tokenType)).Add(delta)
+}
+
+// -------------------------
+// Data Collection
+// -------------------------
+
 // fetchUsageData fetches usage data for a given endpoint and time window.
-// It updates the Prometheus metric with extended token information per token type.
+// It processes each bucket and, for each usage record, updates metrics by computing
+// the difference from the previous scrape.
 func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int64) error {
 	baseURL := fmt.Sprintf("https://api.openai.com/v1/organization/usage/%s", endpoint.Path)
 	nextPage := ""
 
-	// allResults collects all usage records (for logging total count).
+	// allResults collects all usage records (used here only for logging total count).
 	allResults := []UsageResult{}
 
 	for {
@@ -220,19 +300,15 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 					"batch": string(result.Batch),
 				}
 
-				// Update metric for input tokens.
-				tokensTotal.With(mergeLabels(labels, "token_type", "input")).Add(float64(result.InputTokens))
-				// Update metric for output tokens.
-				tokensTotal.With(mergeLabels(labels, "token_type", "output")).Add(float64(result.OutputTokens))
-				// Update metric for input cached tokens.
-				tokensTotal.With(mergeLabels(labels, "token_type", "input_cached")).Add(float64(result.InputCachedTokens))
-				// Update metric for input audio tokens.
-				tokensTotal.With(mergeLabels(labels, "token_type", "input_audio")).Add(float64(result.InputAudioTokens))
-				// Update metric for output audio tokens.
-				tokensTotal.With(mergeLabels(labels, "token_type", "output_audio")).Add(float64(result.OutputAudioTokens))
+				// Update metrics for each token type using the delta approach.
+				updateMetric(labels, "input", bucket.StartTime, float64(result.InputTokens))
+				updateMetric(labels, "output", bucket.StartTime, float64(result.OutputTokens))
+				updateMetric(labels, "input_cached", bucket.StartTime, float64(result.InputCachedTokens))
+				updateMetric(labels, "input_audio", bucket.StartTime, float64(result.InputAudioTokens))
+				updateMetric(labels, "output_audio", bucket.StartTime, float64(result.OutputAudioTokens))
 
-				logrus.Debugf("Processed result - Model: %s, Operation: %s, ProjectID: %s, UserID: %s, APIKeyID: %s, Batch: %s, InputTokens: %d, OutputTokens: %d, InputCached: %d, InputAudio: %d, OutputAudio: %d, Requests: %d",
-					deref(result.Model), endpoint.Name, deref(result.ProjectID), deref(result.UserID), deref(result.APIKeyID), string(result.Batch),
+				logrus.Debugf("Processed result - Model: %s, Operation: %s, ProjectID: %s, UserID: %s, APIKeyID: %s, Batch: %s, BucketStart: %d, InputTokens: %d, OutputTokens: %d, InputCached: %d, InputAudio: %d, OutputAudio: %d, Requests: %d",
+					deref(result.Model), endpoint.Name, deref(result.ProjectID), deref(result.UserID), deref(result.APIKeyID), string(result.Batch), bucket.StartTime,
 					result.InputTokens, result.OutputTokens, result.InputCachedTokens, result.InputAudioTokens, result.OutputAudioTokens, result.NumModelRequests)
 			}
 		}
@@ -246,16 +322,6 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 
 	logrus.Infof("Total records fetched from %s: %d", endpoint.Path, len(allResults))
 	return nil
-}
-
-// mergeLabels returns a new map merging base labels with an extra key-value pair.
-func mergeLabels(base prometheus.Labels, key, value string) prometheus.Labels {
-	newLabels := make(prometheus.Labels, len(base)+1)
-	for k, v := range base {
-		newLabels[k] = v
-	}
-	newLabels[key] = value
-	return newLabels
 }
 
 // deref returns the value of a string pointer or "unknown" if it is nil.
@@ -291,6 +357,10 @@ func (e *Exporter) collect() {
 		time.Sleep(*scrapeInterval)
 	}
 }
+
+// -------------------------
+// Main Function
+// -------------------------
 
 // main initializes the exporter and starts the HTTP server to expose metrics.
 func main() {
