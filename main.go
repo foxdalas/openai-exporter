@@ -14,21 +14,21 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// UsageEndpoint represents API usage endpoints
+// UsageEndpoint represents an API usage endpoint.
 type UsageEndpoint struct {
-	Path string
-	Name string
+	Path string // API endpoint path (e.g. "completions")
+	Name string // Name of the operation (e.g. "completions")
 }
 
 var (
-	// CLI flags
+	// CLI flags for configuring the exporter.
 	listenAddress  = flag.String("web.listen-address", ":9185", "Address to listen on for web interface and telemetry")
 	metricsPath    = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics")
 	scrapeInterval = flag.Duration("scrape.interval", 1*time.Minute, "Interval for API calls and data window")
 	queryOffset    = flag.Duration("query.offset", 60*time.Minute, "Offset window for API queries")
 	logLevel       = flag.String("log.level", "info", "Log level")
 
-	// Available endpoints
+	// Available endpoints for which usage data will be fetched.
 	usageEndpoints = []UsageEndpoint{
 		{Path: "completions", Name: "completions"},
 		{Path: "embeddings", Name: "embeddings"},
@@ -39,7 +39,7 @@ var (
 		{Path: "vector_stores", Name: "vector_stores"},
 	}
 
-	// Prometheus metrics
+	// Prometheus metric to count the total tokens used.
 	tokensTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "openai_api_tokens_total",
@@ -51,6 +51,8 @@ var (
 
 func init() {
 	flag.Parse()
+
+	// Parse and set the log level.
 	level, err := logrus.ParseLevel(*logLevel)
 	if err != nil {
 		logrus.WithError(err).Fatal("Failed to parse log level")
@@ -60,16 +62,20 @@ func init() {
 	logrus.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp: true,
 	})
+
+	// Register the Prometheus metric.
 	prometheus.MustRegister(tokensTotal)
 	logrus.Info("Metrics registered successfully")
 }
 
+// Exporter holds the HTTP client and credentials for fetching usage data.
 type Exporter struct {
 	client *http.Client
 	apiKey string
 	orgID  string
 }
 
+// APIResponse is the structure of the response from the OpenAI API.
 type APIResponse struct {
 	Object   string   `json:"object"`
 	Data     []Bucket `json:"data"`
@@ -77,12 +83,14 @@ type APIResponse struct {
 	NextPage string   `json:"next_page"`
 }
 
+// Bucket represents a time bucket in the API response.
 type Bucket struct {
 	StartTime int64         `json:"start_time"`
 	EndTime   int64         `json:"end_time"`
 	Results   []UsageResult `json:"results"`
 }
 
+// UsageResult represents a single usage record.
 type UsageResult struct {
 	InputTokens      int64   `json:"input_tokens"`
 	OutputTokens     int64   `json:"output_tokens"`
@@ -93,6 +101,7 @@ type UsageResult struct {
 	Model            *string `json:"model"`
 }
 
+// NewExporter creates a new Exporter instance using credentials from environment variables.
 func NewExporter() (*Exporter, error) {
 	apiKey := os.Getenv("OPENAI_SECRET_KEY")
 	if apiKey == "" {
@@ -109,16 +118,19 @@ func NewExporter() (*Exporter, error) {
 	}, nil
 }
 
+// fetchUsageData fetches usage data for a given endpoint and time window.
+// It also updates the Prometheus metric with the total tokens (input + output).
 func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int64) error {
 	baseURL := fmt.Sprintf("https://api.openai.com/v1/organization/usage/%s", endpoint.Path)
 	nextPage := ""
 
+	// allResults collects all usage records (used here only for logging the total count).
 	allResults := []UsageResult{}
 
 	for {
-		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&bucket_width=1m&limit=60&group_by=project_id,user_id,api_key_id,model",
+		// Build the request URL with query parameters.
+		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&bucket_width=1m&limit=1440&group_by=project_id,user_id,api_key_id,model",
 			baseURL, startTime, endTime)
-
 		if nextPage != "" {
 			url += "&page=" + nextPage
 		}
@@ -130,6 +142,7 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
+		// Set the authorization header.
 		req.Header.Set("Authorization", "Bearer "+e.apiKey)
 
 		resp, err := e.client.Do(req)
@@ -143,9 +156,21 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 			return fmt.Errorf("error decoding response: %w", err)
 		}
 
+		// Process each bucket and update metrics for every usage record.
 		for _, bucket := range response.Data {
 			for _, result := range bucket.Results {
 				allResults = append(allResults, result)
+
+				// Update the Prometheus counter metric with the total tokens used.
+				// Here, we sum the input and output tokens.
+				tokensTotal.With(prometheus.Labels{
+					"model":      deref(result.Model),
+					"operation":  endpoint.Name, // Label by operation (endpoint name)
+					"project_id": deref(result.ProjectID),
+					"user_id":    deref(result.UserID),
+					"api_key_id": deref(result.APIKeyID),
+					"type":       "total", // Token type label (can be extended if needed)
+				}).Add(float64(result.InputTokens + result.OutputTokens))
 
 				logrus.Debugf("ProjectID: %s, UserID: %s, APIKeyID: %s, Model: %s, InputTokens: %d, OutputTokens: %d, Requests: %d",
 					deref(result.ProjectID), deref(result.UserID), deref(result.APIKeyID), deref(result.Model),
@@ -153,10 +178,10 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 			}
 		}
 
+		// If there are no more pages, exit the loop.
 		if !response.HasMore {
 			break
 		}
-
 		nextPage = response.NextPage
 	}
 
@@ -164,6 +189,7 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 	return nil
 }
 
+// deref returns the value of a string pointer or "unknown" if it is nil.
 func deref(s *string) string {
 	if s == nil {
 		return "unknown"
@@ -171,6 +197,7 @@ func deref(s *string) string {
 	return *s
 }
 
+// collect starts the periodic collection of usage data from all endpoints.
 func (e *Exporter) collect() {
 	for {
 		logrus.Info("Starting collection cycle")
@@ -179,6 +206,7 @@ func (e *Exporter) collect() {
 		endTime := time.Now().Unix()
 
 		var wg sync.WaitGroup
+		// Fetch data concurrently for each endpoint.
 		for _, endpoint := range usageEndpoints {
 			wg.Add(1)
 			go func(ep UsageEndpoint) {
@@ -190,18 +218,22 @@ func (e *Exporter) collect() {
 		}
 
 		wg.Wait()
+		// Wait for the configured scrape interval before starting the next cycle.
 		time.Sleep(*scrapeInterval)
 	}
 }
 
+// main initializes the exporter and starts the HTTP server to expose metrics.
 func main() {
 	exporter, err := NewExporter()
 	if err != nil {
 		logrus.Fatal(err)
 	}
 
+	// Start the usage data collection in a separate goroutine.
 	go exporter.collect()
 
+	// Set up HTTP handlers for Prometheus metrics and a simple root page.
 	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		_, err := w.Write([]byte("<html><head><title>OpenAI Exporter</title></head><body><h1>OpenAI Exporter</h1><p><a href='" + *metricsPath + "'>Metrics</a></p></body></html>"))
