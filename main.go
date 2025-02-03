@@ -14,6 +14,43 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// StringOrBool is a custom type that unmarshals a JSON value that may be either a string, a bool, or null.
+// For a boolean value, it converts the value to its string representation ("true" or "false").
+// For a null value, it returns "unknown".
+type StringOrBool string
+
+// UnmarshalJSON implements the json.Unmarshaler interface for StringOrBool.
+func (s *StringOrBool) UnmarshalJSON(b []byte) error {
+	// If the value is null, set s to "unknown".
+	if string(b) == "null" {
+		*s = "unknown"
+		return nil
+	}
+
+	// If the JSON value is a string (starts with a quote), unmarshal it as a string.
+	if b[0] == '"' {
+		var tmp string
+		if err := json.Unmarshal(b, &tmp); err != nil {
+			return err
+		}
+		*s = StringOrBool(tmp)
+		return nil
+	}
+
+	// Otherwise, try to unmarshal the value as a boolean.
+	var tmp bool
+	if err := json.Unmarshal(b, &tmp); err == nil {
+		if tmp {
+			*s = "true"
+		} else {
+			*s = "false"
+		}
+		return nil
+	}
+
+	return fmt.Errorf("unsupported type for StringOrBool: %s", string(b))
+}
+
 // UsageEndpoint represents an API usage endpoint.
 type UsageEndpoint struct {
 	Path string // API endpoint path (e.g. "completions")
@@ -39,13 +76,16 @@ var (
 		{Path: "vector_stores", Name: "vector_stores"},
 	}
 
-	// Prometheus metric to count the total tokens used.
+	// Prometheus metric to count tokens with extended labels.
+	// Extra labels include:
+	// - batch: identifier from the API result (which may be a string or bool)
+	// - token_type: distinguishes token counts ("input", "output", "input_cached", "input_audio", "output_audio")
 	tokensTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "openai_api_tokens_total",
-			Help: "Total number of tokens used per model, operation, project, user, and API key",
+			Help: "Total number of tokens used per model, operation, project, user, API key, batch and token type",
 		},
-		[]string{"model", "operation", "project_id", "user_id", "api_key_id", "type"},
+		[]string{"model", "operation", "project_id", "user_id", "api_key_id", "batch", "token_type"},
 	)
 )
 
@@ -85,20 +125,27 @@ type APIResponse struct {
 
 // Bucket represents a time bucket in the API response.
 type Bucket struct {
+	Object    string        `json:"object"`
 	StartTime int64         `json:"start_time"`
 	EndTime   int64         `json:"end_time"`
 	Results   []UsageResult `json:"results"`
 }
 
 // UsageResult represents a single usage record.
+// Extended to include additional token fields and the batch identifier.
 type UsageResult struct {
-	InputTokens      int64   `json:"input_tokens"`
-	OutputTokens     int64   `json:"output_tokens"`
-	NumModelRequests int64   `json:"num_model_requests"`
-	ProjectID        *string `json:"project_id"`
-	UserID           *string `json:"user_id"`
-	APIKeyID         *string `json:"api_key_id"`
-	Model            *string `json:"model"`
+	Object            string       `json:"object"`
+	InputTokens       int64        `json:"input_tokens"`
+	OutputTokens      int64        `json:"output_tokens"`
+	InputCachedTokens int64        `json:"input_cached_tokens"`
+	InputAudioTokens  int64        `json:"input_audio_tokens"`
+	OutputAudioTokens int64        `json:"output_audio_tokens"`
+	NumModelRequests  int64        `json:"num_model_requests"`
+	ProjectID         *string      `json:"project_id"`
+	UserID            *string      `json:"user_id"`
+	APIKeyID          *string      `json:"api_key_id"`
+	Model             *string      `json:"model"`
+	Batch             StringOrBool `json:"batch"`
 }
 
 // NewExporter creates a new Exporter instance using credentials from environment variables.
@@ -119,17 +166,18 @@ func NewExporter() (*Exporter, error) {
 }
 
 // fetchUsageData fetches usage data for a given endpoint and time window.
-// It also updates the Prometheus metric with the total tokens (input + output).
+// It updates the Prometheus metric with extended token information per token type.
 func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int64) error {
 	baseURL := fmt.Sprintf("https://api.openai.com/v1/organization/usage/%s", endpoint.Path)
 	nextPage := ""
 
-	// allResults collects all usage records (used here only for logging the total count).
+	// allResults collects all usage records (for logging total count).
 	allResults := []UsageResult{}
 
 	for {
 		// Build the request URL with query parameters.
-		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&bucket_width=1m&limit=1440&group_by=project_id,user_id,api_key_id,model",
+		// Notice that we now group by batch as well.
+		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&bucket_width=1m&limit=1440&group_by=project_id,user_id,api_key_id,model,batch",
 			baseURL, startTime, endTime)
 		if nextPage != "" {
 			url += "&page=" + nextPage
@@ -161,20 +209,31 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 			for _, result := range bucket.Results {
 				allResults = append(allResults, result)
 
-				// Update the Prometheus counter metric with the total tokens used.
-				// Here, we sum the input and output tokens.
-				tokensTotal.With(prometheus.Labels{
+				// Prepare common label values.
+				labels := prometheus.Labels{
 					"model":      deref(result.Model),
-					"operation":  endpoint.Name, // Label by operation (endpoint name)
+					"operation":  endpoint.Name,
 					"project_id": deref(result.ProjectID),
 					"user_id":    deref(result.UserID),
 					"api_key_id": deref(result.APIKeyID),
-					"type":       "total", // Token type label (can be extended if needed)
-				}).Add(float64(result.InputTokens + result.OutputTokens))
+					// Use our custom type's string value for the "batch" label.
+					"batch": string(result.Batch),
+				}
 
-				logrus.Debugf("ProjectID: %s, UserID: %s, APIKeyID: %s, Model: %s, InputTokens: %d, OutputTokens: %d, Requests: %d",
-					deref(result.ProjectID), deref(result.UserID), deref(result.APIKeyID), deref(result.Model),
-					result.InputTokens, result.OutputTokens, result.NumModelRequests)
+				// Update metric for input tokens.
+				tokensTotal.With(mergeLabels(labels, "token_type", "input")).Add(float64(result.InputTokens))
+				// Update metric for output tokens.
+				tokensTotal.With(mergeLabels(labels, "token_type", "output")).Add(float64(result.OutputTokens))
+				// Update metric for input cached tokens.
+				tokensTotal.With(mergeLabels(labels, "token_type", "input_cached")).Add(float64(result.InputCachedTokens))
+				// Update metric for input audio tokens.
+				tokensTotal.With(mergeLabels(labels, "token_type", "input_audio")).Add(float64(result.InputAudioTokens))
+				// Update metric for output audio tokens.
+				tokensTotal.With(mergeLabels(labels, "token_type", "output_audio")).Add(float64(result.OutputAudioTokens))
+
+				logrus.Debugf("Processed result - Model: %s, Operation: %s, ProjectID: %s, UserID: %s, APIKeyID: %s, Batch: %s, InputTokens: %d, OutputTokens: %d, InputCached: %d, InputAudio: %d, OutputAudio: %d, Requests: %d",
+					deref(result.Model), endpoint.Name, deref(result.ProjectID), deref(result.UserID), deref(result.APIKeyID), string(result.Batch),
+					result.InputTokens, result.OutputTokens, result.InputCachedTokens, result.InputAudioTokens, result.OutputAudioTokens, result.NumModelRequests)
 			}
 		}
 
@@ -187,6 +246,16 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 
 	logrus.Infof("Total records fetched from %s: %d", endpoint.Path, len(allResults))
 	return nil
+}
+
+// mergeLabels returns a new map merging base labels with an extra key-value pair.
+func mergeLabels(base prometheus.Labels, key, value string) prometheus.Labels {
+	newLabels := make(prometheus.Labels, len(base)+1)
+	for k, v := range base {
+		newLabels[k] = v
+	}
+	newLabels[key] = value
+	return newLabels
 }
 
 // deref returns the value of a string pointer or "unknown" if it is nil.
