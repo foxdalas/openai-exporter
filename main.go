@@ -239,7 +239,6 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 
 		for _, bucket := range response.Data {
 			if len(bucket.Results) > 0 {
-				logrus.Debugf("Bucket start time: %d, end time: %d", time.Unix(bucket.StartTime, 0).Format("2006-01-02 15:04:05"), time.Unix(bucket.EndTime, 0).Format("2006-01-02 15:04:05"))
 				logrus.Debugf("Results %+v", bucket.Results)
 			}
 			for _, result := range bucket.Results {
