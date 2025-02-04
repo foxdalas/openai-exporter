@@ -1,4 +1,4 @@
-![Docker Pulls](https://img.shields.io/docker/pulls/foxdalas/openai-exporter?style=flat-square&link=https%3A%2F%2Fhub.docker.com%2Fr%2Ffoxdalas%2Fopenai-exporter%2F) ![GitHub Release](https://img.shields.io/github/v/release/foxdalas/openai-exporter?style=flat-square)
+[![Docker Pulls](https://img.shields.io/docker/pulls/foxdalas/openai-exporter?style=flat-square)](https://hub.docker.com/r/foxdalas/openai-exporter) [![GitHub Release](https://img.shields.io/github/v/release/foxdalas/openai-exporter?style=flat-square)](https://github.com/foxdalas/openai-exporter/releases)
 
 
 
