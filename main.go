@@ -271,12 +271,14 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 		}
 
 		var response APIResponse
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			_ = resp.Body.Close()
-			return fmt.Errorf("error decoding response: %w", err)
+		decodeErr := json.NewDecoder(resp.Body).Decode(&response)
+		closeErr := resp.Body.Close()
+
+		if decodeErr != nil {
+			return fmt.Errorf("error decoding response: %w", decodeErr)
 		}
-		if err := resp.Body.Close(); err != nil {
-			return fmt.Errorf("failed to close response body: %w", err)
+		if closeErr != nil {
+			logrus.WithError(closeErr).Warn("failed to close response body")
 		}
 		logrus.Debugf("Received response: %+v", response)
 
@@ -345,7 +347,7 @@ func (e *Exporter) ensureProjectName(projectId string) string {
 	if err != nil {
 		return "unknown"
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var obj Project
 	if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil || obj.Name == "" {
@@ -390,11 +392,16 @@ func (e *Exporter) fetchDailyCosts(startTime, endTime int64) error {
 		if err != nil {
 			return fmt.Errorf("error fetching cost data: %w", err)
 		}
-		defer resp.Body.Close()
 
 		var out CostsList
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			return fmt.Errorf("error decoding response: %w", err)
+		decodeErr := json.NewDecoder(resp.Body).Decode(&out)
+		closeErr := resp.Body.Close()
+
+		if decodeErr != nil {
+			return fmt.Errorf("error decoding response: %w", decodeErr)
+		}
+		if closeErr != nil {
+			logrus.WithError(closeErr).Warn("failed to close response body")
 		}
 		logrus.Debugf("Received response: %+v", resp)
 
