@@ -49,10 +49,11 @@ func (s *StringOrBool) UnmarshalJSON(b []byte) error {
 // Global Variables and State
 
 var (
-	stateMu sync.Mutex
+	stateMu sync.RWMutex
 	// usageState stores already processed buckets to avoid double counting.
-	usageState = make(map[string]float64)
-	lastScrape = int64(0)
+	usageState   = make(map[string]float64)
+	lastScrape   = int64(0)
+	projectNames = make(map[string]string) // mapping project_id -> project_name
 )
 
 // Prometheus Metric and CLI Flags
@@ -84,7 +85,14 @@ var (
 			Name: "openai_api_tokens_total",
 			Help: "Total number of tokens used per model, operation, project, user, API key, batch and token type",
 		},
-		[]string{"model", "operation", "project_id", "user_id", "api_key_id", "batch", "token_type"},
+		[]string{"model", "operation", "project_id", "project_name", "user_id", "api_key_id", "batch", "token_type"},
+	)
+	dailyCostUSD = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "openai_daily_cost_usd",
+			Help: "Daily spend in USD by date/project/line_item/organization.",
+		},
+		[]string{"date", "project_id", "project_name", "line_item", "organization_id", "currency"},
 	)
 )
 
@@ -100,6 +108,7 @@ func init() {
 	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
 
 	prometheus.MustRegister(tokensTotal)
+	prometheus.MustRegister(dailyCostUSD)
 	logrus.Info("Metrics registered successfully")
 }
 
@@ -138,6 +147,37 @@ type UsageResult struct {
 	APIKeyID          *string      `json:"api_key_id"`
 	Model             *string      `json:"model"`
 	Batch             StringOrBool `json:"batch"`
+}
+
+type Project struct {
+	Name string `json:"name"`
+}
+
+type CostsList struct {
+	Object   string       `json:"object"`
+	Data     []CostBucket `json:"data"`
+	HasMore  bool         `json:"has_more"`
+	NextPage string       `json:"next_page"`
+}
+
+type CostBucket struct {
+	Object    string       `json:"object"`
+	StartTime int64        `json:"start_time"`
+	EndTime   int64        `json:"end_time"`
+	Results   []CostResult `json:"results"`
+}
+
+type Money struct {
+	Value    float64 `json:"value"`
+	Currency string  `json:"currency"`
+}
+
+type CostResult struct {
+	Object         string  `json:"object"`
+	Amount         Money   `json:"amount"`
+	LineItem       *string `json:"line_item"`
+	ProjectID      *string `json:"project_id"`
+	OrganizationID string  `json:"organization_id"`
 }
 
 func NewExporter() (*Exporter, error) {
@@ -248,12 +288,13 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 				allResults = append(allResults, result)
 
 				labels := prometheus.Labels{
-					"model":      deref(result.Model),
-					"operation":  endpoint.Name,
-					"project_id": deref(result.ProjectID),
-					"user_id":    deref(result.UserID),
-					"api_key_id": deref(result.APIKeyID),
-					"batch":      string(result.Batch),
+					"model":        deref(result.Model),
+					"operation":    endpoint.Name,
+					"project_id":   deref(result.ProjectID),
+					"project_name": e.ensureProjectName(deref(result.ProjectID)),
+					"user_id":      deref(result.UserID),
+					"api_key_id":   deref(result.APIKeyID),
+					"batch":        string(result.Batch),
 				}
 
 				updateMetric(labels, "input", bucket.StartTime, bucket.EndTime, float64(result.InputTokens))
@@ -279,11 +320,147 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 	return nil
 }
 
+// ensureProjectName returns the name for already known projects and exports the name for new ones
+func (e *Exporter) ensureProjectName(projectId string) string {
+	if projectId == "" || projectId == "unknown" {
+		return "unknown"
+	}
+
+	stateMu.RLock()
+	if n, ok := projectNames[projectId]; ok && n != "" {
+		stateMu.RUnlock()
+		return n
+	}
+	stateMu.RUnlock()
+
+	url := fmt.Sprintf("https://api.openai.com/v1/organization/projects/%s", projectId)
+	logrus.Debugf("Fetching project name: %s", url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "unknown"
+	}
+	req.Header.Set("Authorization", "Bearer "+e.apiKey)
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return "unknown"
+	}
+	defer resp.Body.Close()
+
+	var obj Project
+	if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil || obj.Name == "" {
+		return "unknown"
+	}
+	logrus.Debugf("Received response: %+v", resp)
+
+	stateMu.Lock()
+	projectNames[projectId] = obj.Name
+	stateMu.Unlock()
+	return obj.Name
+}
+
 func deref(s *string) string {
 	if s == nil {
 		return "unknown"
 	}
 	return *s
+}
+
+// fetchDailyCost downloads information about the cost of projects
+func (e *Exporter) fetchDailyCosts(startTime, endTime int64) error {
+	baseURL := "https://api.openai.com/v1/organization/costs"
+	nextPage := ""
+
+	for {
+		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&granularity=day&group_by=project_id",
+			baseURL, startTime, endTime)
+		if nextPage != "" {
+			url += "&page=" + nextPage
+		}
+
+		logrus.Debugf("Fetching cost data: %s", url)
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+e.apiKey)
+
+		resp, err := e.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("error fetching cost data: %w", err)
+		}
+		defer resp.Body.Close()
+
+		var out CostsList
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return fmt.Errorf("error decoding response: %w", err)
+		}
+		logrus.Debugf("Received response: %+v", resp)
+
+		for _, bucket := range out.Data {
+			if len(bucket.Results) > 0 {
+				logrus.Debugf("Results %+v", bucket.Results)
+			}
+			date := time.Unix(bucket.StartTime, 0).UTC().Format("2006-01-02")
+			for _, res := range bucket.Results {
+				projectId := deref(res.ProjectID)
+				lineName := "unknown"
+				if res.LineItem != nil && *res.LineItem != "" {
+					lineName = *res.LineItem
+				}
+				labels := prometheus.Labels{
+					"date":            date,
+					"project_id":      projectId,
+					"project_name":    e.ensureProjectName(projectId),
+					"line_item":       lineName,
+					"organization_id": res.OrganizationID,
+					"currency":        res.Amount.Currency,
+				}
+				dailyCostUSD.With(labels).Set(res.Amount.Value)
+				logrus.Debugf("Processed result - Date: %s, ProjectID: %s, ProjectName: %s, LineItem: %s, OrganizationID: %s, Cost: %f, Currency: %s",
+					date, projectId, e.ensureProjectName(projectId), lineName, res.OrganizationID, res.Amount.Value, res.Amount.Currency)
+			}
+		}
+
+		if !out.HasMore {
+			break
+		}
+		nextPage = out.NextPage
+	}
+
+	return nil
+}
+
+// dayBountsUTC defines the boundaries of the day
+func dayBoundsUTC(t time.Time) (int64, int64) {
+	u := t.UTC()
+	startTime := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+	endTime := startTime.Add(24 * time.Hour)
+	return startTime.Unix(), endTime.Unix()
+}
+
+// collectCost downloads price data once a day
+func (e *Exporter) collectCost() {
+	now := time.Now().UTC()
+	start, _ := dayBoundsUTC(now.AddDate(0, 0, -2))
+	_, end := dayBoundsUTC(now)
+	logrus.Infof("Starting initial collection cost: startTime=%d, endTime=%d", start, end)
+	if err := e.fetchDailyCosts(start, end); err != nil {
+		logrus.WithError(err).Warn("initial daily costs fetch failed")
+	}
+
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		y := time.Now().UTC().AddDate(0, 0, -1)
+		startTime, endTime := dayBoundsUTC(y)
+		logrus.Infof("Starting collection cost: startTime=%d, endTime=%d", startTime, endTime)
+		if err := e.fetchDailyCosts(startTime, endTime); err != nil {
+			logrus.WithError(err).Warn("daily costs fetch (yesterday) failed")
+		}
+	}
 }
 
 // collect performs a loop to gather data for the last time window (one minute).
@@ -321,6 +498,7 @@ func main() {
 	}
 
 	go exporter.collect()
+	go exporter.collectCost()
 
 	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
