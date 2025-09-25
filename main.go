@@ -229,11 +229,14 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 		if err != nil {
 			return fmt.Errorf("error fetching usage data: %w", err)
 		}
-		defer resp.Body.Close()
 
 		var response APIResponse
 		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+			_ = resp.Body.Close()
 			return fmt.Errorf("error decoding response: %w", err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			return fmt.Errorf("failed to close response body: %w", err)
 		}
 		logrus.Debugf("Received response: %+v", response)
 
