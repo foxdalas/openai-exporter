@@ -97,19 +97,18 @@ var (
 )
 
 func init() {
-	flag.Parse()
+	prometheus.MustRegister(tokensTotal)
+	prometheus.MustRegister(dailyCostUSD)
+}
 
+func setupLogging() {
 	level, err := logrus.ParseLevel(*logLevel)
 	if err != nil {
 		logrus.WithError(err).Fatal("Failed to parse log level")
 	}
 	logrus.SetLevel(level)
-	logrus.Infof("Log level set to %s", level)
 	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
-
-	prometheus.MustRegister(tokensTotal)
-	prometheus.MustRegister(dailyCostUSD)
-	logrus.Info("Metrics registered successfully")
+	logrus.Infof("Log level set to %s", level)
 }
 
 // Exporter and API Structures
@@ -498,6 +497,9 @@ func (e *Exporter) collect() {
 // Main Function
 
 func main() {
+	flag.Parse()
+	setupLogging()
+
 	lastScrape = time.Now().Round(time.Minute).Add(-time.Minute).Unix()
 	exporter, err := NewExporter()
 	if err != nil {
