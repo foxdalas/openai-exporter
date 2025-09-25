@@ -89,8 +89,8 @@ var (
 	)
 	dailyCostUSD = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "openai_daily_cost_usd",
-			Help: "Daily spend in USD by date/project/line_item/organization.",
+			Name: "openai_api_daily_cost",
+			Help: "Daily spend by date/project/line_item/organization (currency indicated by label).",
 		},
 		[]string{"date", "project_id", "project_name", "line_item", "organization_id", "currency"},
 	)

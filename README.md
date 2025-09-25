@@ -55,6 +55,7 @@ openai_api_tokens_total{api_key_id="",batch="false",model="gpt-4-turbo-2024-04-0
 openai_api_tokens_total{api_key_id="",batch="false",model="gpt-4-turbo-2024-04-09",operation="completions",project_id="",token_type="input_cached",user_id=""} 0
 openai_api_tokens_total{api_key_id="",batch="false",model="gpt-4-turbo-2024-04-09",operation="completions",project_id="",token_type="output",user_id=""} 1432
 openai_api_tokens_total{api_key_id="",batch="false",model="gpt-4-turbo-2024-04-09",operation="completions",project_id="",token_type="output_audio",user_id=""} 0
+openai_api_daily_cost{currency="usd",date="2024-01-15",line_item="GPT-4 Turbo",organization_id="org-123",project_id="proj-456",project_name="production"} 42.50
 ```
 
 ## Contributing
