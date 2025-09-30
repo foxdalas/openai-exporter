@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -90,27 +91,26 @@ var (
 	)
 	dailyCostUSD = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "openai_daily_cost_usd",
-			Help: "Daily spend in USD by date/project/line_item/organization.",
+			Name: "openai_api_daily_cost",
+			Help: "Daily spend by date/project/line_item/organization (currency indicated by label).",
 		},
 		[]string{"date", "project_id", "project_name", "line_item", "organization_id", "currency"},
 	)
 )
 
 func init() {
-	flag.Parse()
+	prometheus.MustRegister(tokensTotal)
+	prometheus.MustRegister(dailyCostUSD)
+}
 
+func setupLogging() {
 	level, err := logrus.ParseLevel(*logLevel)
 	if err != nil {
 		logrus.WithError(err).Fatal("Failed to parse log level")
 	}
 	logrus.SetLevel(level)
-	logrus.Infof("Log level set to %s", level)
 	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
-
-	prometheus.MustRegister(tokensTotal)
-	prometheus.MustRegister(dailyCostUSD)
-	logrus.Info("Metrics registered successfully")
+	logrus.Infof("Log level set to %s", level)
 }
 
 // Exporter and API Structures
@@ -274,11 +274,16 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 		if err != nil {
 			return fmt.Errorf("error fetching usage data: %w", err)
 		}
-		defer resp.Body.Close()
 
 		var response APIResponse
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			return fmt.Errorf("error decoding response: %w", err)
+		decodeErr := json.NewDecoder(resp.Body).Decode(&response)
+		closeErr := resp.Body.Close()
+
+		if decodeErr != nil {
+			return fmt.Errorf("error decoding response: %w", decodeErr)
+		}
+		if closeErr != nil {
+			logrus.WithError(closeErr).Warn("failed to close response body")
 		}
 		logrus.Debugf("Received response: %+v", response)
 
@@ -348,16 +353,13 @@ func (e *Exporter) ensureProjectName(projectId string) string {
 	if err != nil {
 		return "unknown"
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var obj Project
 	if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil || obj.Name == "" {
 		return "unknown"
 	}
 	logrus.Debugf("Received response: %+v", resp)
-	if err := resp.Body.Close(); err != nil {
-		return "unknown"
-	}
 
 	stateMu.Lock()
 	projectNames[projectId] = obj.Name
@@ -386,7 +388,6 @@ func (e *Exporter) ensureAPIKeyName(projectID, apiKeyID string) string {
 	urls = append(urls,
 		fmt.Sprintf("https://api.openai.com/v1/organization/api_keys/%s", apiKeyID))
 
-	var name string
 	for _, u := range urls {
 		logrus.Debugf("Fetching api key name: %s", u)
 		req, err := http.NewRequest("GET", u, nil)
@@ -395,37 +396,35 @@ func (e *Exporter) ensureAPIKeyName(projectID, apiKeyID string) string {
 		}
 		req.Header.Set("Authorization", "Bearer "+e.apiKey)
 
-		resp, err := e.client.Do(req)
-		if err != nil {
-			resp.Body.Close()
-			continue
-		}
+		if name, ok := func() (string, bool) {
+			resp, err := e.client.Do(req)
+			if err != nil {
+				return "", false
+			}
+			defer func() { _ = resp.Body.Close() }()
 
-		if resp.StatusCode/100 != 2 {
-			resp.Body.Close()
-			continue
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				_, _ = io.Copy(io.Discard, resp.Body) // дренируем
+				return "", false
+			}
+
+			var obj APIKey
+			if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
+				return "", false
+			}
+			if obj.Name == "" {
+				return "", false
+			}
+			return obj.Name, true
+		}(); ok {
+			stateMu.Lock()
+			apiKeyNames[apiKeyID] = name
+			stateMu.Unlock()
+			return name
 		}
-		var obj APIKey
-		logrus.Debugf("Received response: %+v", resp)
-		if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
-			resp.Body.Close()
-			continue
-		}
-		if obj.Name != "" {
-			name = obj.Name
-			break
-		}
-		resp.Body.Close()
 	}
 
-	if name == "" {
-		name = "unknown"
-	}
-
-	stateMu.Lock()
-	apiKeyNames[apiKeyID] = name
-	stateMu.Unlock()
-	return name
+	return "unknown"
 }
 
 func deref(s *string) string {
@@ -461,11 +460,14 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 		}
 
 		var out CostsList
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			return fmt.Errorf("error decoding response: %w", err)
+		decodeErr := json.NewDecoder(resp.Body).Decode(&out)
+		closeErr := resp.Body.Close()
+
+		if decodeErr != nil {
+			return fmt.Errorf("error decoding response: %w", decodeErr)
 		}
-		if err := resp.Body.Close(); err != nil {
-			return fmt.Errorf("failed to close response body: %w", err)
+		if closeErr != nil {
+			logrus.WithError(closeErr).Warn("failed to close response body")
 		}
 		logrus.Debugf("Received response: %+v", resp)
 
@@ -499,6 +501,7 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 		}
 		nextPage = out.NextPage
 	}
+
 	return nil
 }
 
@@ -538,6 +541,9 @@ func (e *Exporter) collect() {
 // Main Function
 
 func main() {
+	flag.Parse()
+	setupLogging()
+
 	lastScrape = time.Now().Round(time.Minute).Add(-*scrapeInterval).Unix()
 	exporter, err := NewExporter()
 	if err != nil {
