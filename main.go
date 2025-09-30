@@ -70,7 +70,7 @@ var (
 	metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics")
 	// API polling interval; also used to determine the time window (last minute).
 	scrapeInterval = flag.Duration("scrape.interval", 1*time.Minute, "Interval for API calls and data window")
-	logLevel       = flag.String("log.level", "debug", "Log level")
+	logLevel       = flag.String("log.level", "info", "Log level")
 
 	usageEndpoints = []UsageEndpoint{
 		{Path: "completions", Name: "completions"},
