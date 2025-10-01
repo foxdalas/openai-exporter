@@ -114,48 +114,6 @@ func TestMergeLabels(t *testing.T) {
 	assert.Len(t, base, 2)
 }
 
-func TestDayBoundsUTC(t *testing.T) {
-	tests := []struct {
-		name          string
-		input         time.Time
-		expectedStart int64
-		expectedEnd   int64
-	}{
-		{
-			name:          "middle of day",
-			input:         time.Date(2024, 1, 15, 14, 30, 45, 0, time.UTC),
-			expectedStart: time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC).Unix(),
-			expectedEnd:   time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC).Unix(),
-		},
-		{
-			name:          "start of day",
-			input:         time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC),
-			expectedStart: time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC).Unix(),
-			expectedEnd:   time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC).Unix(),
-		},
-		{
-			name:          "end of day",
-			input:         time.Date(2024, 1, 15, 23, 59, 59, 0, time.UTC),
-			expectedStart: time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC).Unix(),
-			expectedEnd:   time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC).Unix(),
-		},
-		{
-			name:          "non-UTC timezone",
-			input:         time.Date(2024, 1, 15, 14, 30, 45, 0, time.FixedZone("EST", -5*3600)),
-			expectedStart: time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC).Unix(),
-			expectedEnd:   time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC).Unix(),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			start, end := dayBoundsUTC(tt.input)
-			assert.Equal(t, tt.expectedStart, start)
-			assert.Equal(t, tt.expectedEnd, end)
-		})
-	}
-}
-
 func TestUpdateMetric(t *testing.T) {
 	usageState = make(map[string]float64)
 	lastScrape = 0
@@ -167,6 +125,7 @@ func TestUpdateMetric(t *testing.T) {
 		"project_name": "test-project",
 		"user_id":      "user-456",
 		"api_key_id":   "key-789",
+		"api_key_name": "key-name",
 		"batch":        "false",
 	}
 
@@ -290,6 +249,67 @@ func TestEnsureProjectName(t *testing.T) {
 	})
 }
 
+func TestEnsureAPIKeyName(t *testing.T) {
+	apiKeyNames = make(map[string]string)
+
+	t.Run("empty api key id", func(t *testing.T) {
+		e := &Exporter{apiKey: "test"}
+		result := e.ensureAPIKeyName("proj-123", "")
+		assert.Equal(t, "unknown", result)
+	})
+
+	t.Run("unknown api key id", func(t *testing.T) {
+		e := &Exporter{apiKey: "test"}
+		result := e.ensureAPIKeyName("proj-123", "unknown")
+		assert.Equal(t, "unknown", result)
+	})
+
+	t.Run("cached api key name", func(t *testing.T) {
+		apiKeyNames = make(map[string]string)
+		apiKeyNames["key-123"] = "cached-key"
+
+		e := &Exporter{apiKey: "test"}
+		result := e.ensureAPIKeyName("proj-123", "key-123")
+		assert.Equal(t, "cached-key", result)
+	})
+
+	t.Run("fetch api key name from API (parsing only)", func(t *testing.T) {
+		apiKeyNames = make(map[string]string)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(APIKey{Name: "fetched-key"})
+		}))
+		defer server.Close()
+
+		client := &http.Client{}
+		req, _ := http.NewRequest("GET", server.URL, nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		defer func() { _ = resp.Body.Close() }()
+
+		var k APIKey
+		err = json.NewDecoder(resp.Body).Decode(&k)
+		require.NoError(t, err)
+
+		assert.Equal(t, "fetched-key", k.Name)
+	})
+
+	t.Run("API error returns unknown", func(t *testing.T) {
+		apiKeyNames = make(map[string]string)
+
+		e := &Exporter{
+			client: &http.Client{Timeout: 1 * time.Millisecond},
+			apiKey: "test-key",
+		}
+
+		result := e.ensureAPIKeyName("proj-any", "key-timeout")
+		assert.Equal(t, "unknown", result)
+	})
+}
+
 func TestFetchUsageData_ErrorCases(t *testing.T) {
 	t.Run("HTTP request error", func(t *testing.T) {
 		e := &Exporter{
@@ -327,14 +347,14 @@ func TestFetchUsageData_ErrorCases(t *testing.T) {
 	})
 }
 
-func TestFetchDailyCosts_ErrorCases(t *testing.T) {
+func TestFetchCostData_ErrorCases(t *testing.T) {
 	t.Run("HTTP request error", func(t *testing.T) {
 		e := &Exporter{
 			client: &http.Client{Timeout: 1 * time.Millisecond},
 			apiKey: "test-key",
 		}
 
-		err := e.fetchDailyCosts(1000, 2000)
+		err := e.fetchCostData(1000, 2000)
 		assert.Error(t, err)
 	})
 
@@ -357,7 +377,7 @@ func TestFetchDailyCosts_ErrorCases(t *testing.T) {
 			apiKey: "test-key",
 		}
 
-		err := e.fetchDailyCosts(1000, 2000)
+		err := e.fetchCostData(1000, 2000)
 		assert.Error(t, err)
 	})
 }

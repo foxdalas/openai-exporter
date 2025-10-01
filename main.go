@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -54,6 +55,7 @@ var (
 	usageState   = make(map[string]float64)
 	lastScrape   = int64(0)
 	projectNames = make(map[string]string) // mapping project_id -> project_name
+	apiKeyNames  = make(map[string]string) // mapping api_key_id -> api_key_name
 )
 
 // Prometheus Metric and CLI Flags
@@ -85,7 +87,7 @@ var (
 			Name: "openai_api_tokens_total",
 			Help: "Total number of tokens used per model, operation, project, user, API key, batch and token type",
 		},
-		[]string{"model", "operation", "project_id", "project_name", "user_id", "api_key_id", "batch", "token_type"},
+		[]string{"model", "operation", "project_id", "project_name", "user_id", "api_key_id", "api_key_name", "batch", "token_type"},
 	)
 	dailyCostUSD = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -149,6 +151,10 @@ type UsageResult struct {
 }
 
 type Project struct {
+	Name string `json:"name"`
+}
+
+type APIKey struct {
 	Name string `json:"name"`
 }
 
@@ -295,6 +301,7 @@ func (e *Exporter) fetchUsageData(endpoint UsageEndpoint, startTime, endTime int
 					"project_name": e.ensureProjectName(deref(result.ProjectID)),
 					"user_id":      deref(result.UserID),
 					"api_key_id":   deref(result.APIKeyID),
+					"api_key_name": e.ensureAPIKeyName(deref(result.ProjectID), deref(result.APIKeyID)),
 					"batch":        string(result.Batch),
 				}
 
@@ -360,6 +367,66 @@ func (e *Exporter) ensureProjectName(projectId string) string {
 	return obj.Name
 }
 
+// ensureProjectName returns the name for already known API keys and exports the name for new ones
+func (e *Exporter) ensureAPIKeyName(projectID, apiKeyID string) string {
+	if apiKeyID == "" || apiKeyID == "unknown" {
+		return "unknown"
+	}
+
+	stateMu.RLock()
+	if n, ok := apiKeyNames[apiKeyID]; ok && n != "" {
+		stateMu.RUnlock()
+		return n
+	}
+	stateMu.RUnlock()
+
+	var urls []string
+	if projectID != "" && projectID != "unknown" {
+		urls = append(urls,
+			fmt.Sprintf("https://api.openai.com/v1/organization/projects/%s/api_keys/%s", projectID, apiKeyID))
+	}
+	urls = append(urls,
+		fmt.Sprintf("https://api.openai.com/v1/organization/api_keys/%s", apiKeyID))
+
+	for _, u := range urls {
+		logrus.Debugf("Fetching api key name: %s", u)
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+e.apiKey)
+
+		if name, ok := func() (string, bool) {
+			resp, err := e.client.Do(req)
+			if err != nil {
+				return "", false
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				_, _ = io.Copy(io.Discard, resp.Body) // дренируем
+				return "", false
+			}
+
+			var obj APIKey
+			if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
+				return "", false
+			}
+			if obj.Name == "" {
+				return "", false
+			}
+			return obj.Name, true
+		}(); ok {
+			stateMu.Lock()
+			apiKeyNames[apiKeyID] = name
+			stateMu.Unlock()
+			return name
+		}
+	}
+
+	return "unknown"
+}
+
 func deref(s *string) string {
 	if s == nil {
 		return "unknown"
@@ -367,13 +434,13 @@ func deref(s *string) string {
 	return *s
 }
 
-// fetchDailyCost downloads information about the cost of projects
-func (e *Exporter) fetchDailyCosts(startTime, endTime int64) error {
+// fetchCostData downloads information about the cost of projects
+func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 	baseURL := "https://api.openai.com/v1/organization/costs"
 	nextPage := ""
 
 	for {
-		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&granularity=day&group_by=project_id",
+		url := fmt.Sprintf("%s?start_time=%d&end_time=%d&group_by=project_id",
 			baseURL, startTime, endTime)
 		if nextPage != "" {
 			url += "&page=" + nextPage
@@ -438,43 +505,13 @@ func (e *Exporter) fetchDailyCosts(startTime, endTime int64) error {
 	return nil
 }
 
-// dayBountsUTC defines the boundaries of the day
-func dayBoundsUTC(t time.Time) (int64, int64) {
-	u := t.UTC()
-	startTime := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
-	endTime := startTime.Add(24 * time.Hour)
-	return startTime.Unix(), endTime.Unix()
-}
-
-// collectCost downloads price data once a day
-func (e *Exporter) collectCost() {
-	now := time.Now().UTC()
-	start, _ := dayBoundsUTC(now.AddDate(0, 0, -2))
-	_, end := dayBoundsUTC(now)
-	logrus.Infof("Starting initial collection cost: startTime=%d, endTime=%d", start, end)
-	if err := e.fetchDailyCosts(start, end); err != nil {
-		logrus.WithError(err).Warn("initial daily costs fetch failed")
-	}
-
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		y := time.Now().UTC().AddDate(0, 0, -1)
-		startTime, endTime := dayBoundsUTC(y)
-		logrus.Infof("Starting collection cost: startTime=%d, endTime=%d", startTime, endTime)
-		if err := e.fetchDailyCosts(startTime, endTime); err != nil {
-			logrus.WithError(err).Warn("daily costs fetch (yesterday) failed")
-		}
-	}
-}
-
 // collect performs a loop to gather data for the last time window (one minute).
 // For each cycle, a time window is determined: from (current time - scrape.interval) to current time.
 func (e *Exporter) collect() {
+	stepSec := int64((*scrapeInterval) / time.Second)
 	for {
 		startTime := lastScrape
-		endTime := lastScrape + 60
+		endTime := lastScrape + stepSec
 
 		logrus.Infof("Starting collection cycle: startTime=%d, endTime=%d", startTime, endTime)
 
@@ -488,8 +525,15 @@ func (e *Exporter) collect() {
 				}
 			}(endpoint)
 		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := e.fetchCostData(startTime, endTime+60*60*24); err != nil {
+				logrus.WithError(err).Warn("Error fetching cost data")
+			}
+		}()
 		wg.Wait()
-		lastScrape += 60
+		lastScrape += stepSec
 		time.Sleep(*scrapeInterval)
 	}
 }
@@ -500,14 +544,13 @@ func main() {
 	flag.Parse()
 	setupLogging()
 
-	lastScrape = time.Now().Round(time.Minute).Add(-time.Minute).Unix()
+	lastScrape = time.Now().Round(time.Minute).Add(-*scrapeInterval).Unix()
 	exporter, err := NewExporter()
 	if err != nil {
 		logrus.Fatal(err)
 	}
 
 	go exporter.collect()
-	go exporter.collectCost()
 
 	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
