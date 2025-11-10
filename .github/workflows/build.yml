@@ -20,7 +20,7 @@ jobs:
           gofmt-flags: '-l -d'
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
 
       - name: Test
         run: go test ./...
