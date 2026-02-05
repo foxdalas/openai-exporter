@@ -382,6 +382,33 @@ func TestFetchCostData_ErrorCases(t *testing.T) {
 	})
 }
 
+func TestMoney_UnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		jsonIn  string
+		wantVal float64
+		wantErr bool
+	}{
+		{"number value", `{"value":0.5,"currency":"usd"}`, 0.5, false},
+		{"string value", `{"value":"0.2911922500000000000000000000","currency":"usd"}`, 0.29119225, false},
+		{"null value", `{"value":null,"currency":"usd"}`, 0, false},
+		{"invalid string", `{"value":"not-a-number","currency":"usd"}`, 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var m Money
+			err := json.Unmarshal([]byte(tt.jsonIn), &m)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.InDelta(t, tt.wantVal, m.Value, 1e-9)
+			}
+		})
+	}
+}
+
 func strPtr(s string) *string {
 	return &s
 }
