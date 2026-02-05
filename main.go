@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -184,21 +183,15 @@ func (m *Money) UnmarshalJSON(b []byte) error {
 		Value    interface{} `json:"value"`
 		Currency string      `json:"currency"`
 	}
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.UseNumber()
-	if err := dec.Decode(&aux); err != nil {
+	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
 	}
 
 	switch v := aux.Value.(type) {
 	case nil:
 		m.Value = 0
-	case json.Number:
-		f, err := v.Float64()
-		if err != nil {
-			return fmt.Errorf("cannot parse Money.value (json.Number): %w", err)
-		}
-		m.Value = f
+	case float64:
+		m.Value = v
 	case string:
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {

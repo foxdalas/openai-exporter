@@ -384,15 +384,21 @@ func TestFetchCostData_ErrorCases(t *testing.T) {
 
 func TestMoney_UnmarshalJSON(t *testing.T) {
 	tests := []struct {
-		name    string
-		jsonIn  string
-		wantVal float64
-		wantErr bool
+		name         string
+		jsonIn       string
+		wantVal      float64
+		wantCurrency string
+		wantErr      bool
 	}{
-		{"number value", `{"value":0.5,"currency":"usd"}`, 0.5, false},
-		{"string value", `{"value":"0.2911922500000000000000000000","currency":"usd"}`, 0.29119225, false},
-		{"null value", `{"value":null,"currency":"usd"}`, 0, false},
-		{"invalid string", `{"value":"not-a-number","currency":"usd"}`, 0, true},
+		{"number value", `{"value":0.5,"currency":"usd"}`, 0.5, "usd", false},
+		{"string value", `{"value":"0.2911922500000000000000000000","currency":"usd"}`, 0.29119225, "usd", false},
+		{"null value", `{"value":null,"currency":"usd"}`, 0, "usd", false},
+		{"invalid string", `{"value":"not-a-number","currency":"usd"}`, 0, "", true},
+		{"other currency", `{"value":1.0,"currency":"eur"}`, 1.0, "eur", false},
+		{"integer value", `{"value":1,"currency":"usd"}`, 1.0, "usd", false},
+		{"empty string value", `{"value":"","currency":"usd"}`, 0, "", true},
+		{"negative value", `{"value":-10.5,"currency":"usd"}`, -10.5, "usd", false},
+		{"high precision string", `{"value":"0.1234567890123456","currency":"usd"}`, 0.1234567890123456, "usd", false},
 	}
 
 	for _, tt := range tests {
@@ -404,6 +410,7 @@ func TestMoney_UnmarshalJSON(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				assert.InDelta(t, tt.wantVal, m.Value, 1e-9)
+				assert.Equal(t, tt.wantCurrency, m.Currency, "Currency field should match")
 			}
 		})
 	}
