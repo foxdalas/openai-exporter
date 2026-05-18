@@ -67,6 +67,146 @@ func TestStringOrBool_UnmarshalJSON(t *testing.T) {
 	}
 }
 
+func TestFloatOrString_UnmarshalJSON_String(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected FloatOrString
+		wantErr  bool
+	}{
+		{
+			name:     "string value",
+			input:    "123.45",
+			expected: 123.45,
+			wantErr:  false,
+		},
+		{
+			name:     "string value many zeros",
+			input:    "0.1739150000000000000000000000",
+			expected: 0.173915,
+			wantErr:  false,
+		},
+		{
+			name:     "int as string",
+			input:    "73",
+			expected: 73.0,
+			wantErr:  false,
+		},
+		{
+			name:     "invalid string value",
+			input:    "foo",
+			expected: 0,
+			wantErr:  true,
+		},
+		{
+			name:     "invalid type",
+			input:    `[]`,
+			expected: 0,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var f FloatOrString
+			err := json.Unmarshal([]byte(tt.input), &f)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.expected, f)
+			}
+		})
+	}
+}
+
+func TestFloatOrString_UnmarshalJSON_Float(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    float64
+		expected FloatOrString
+		wantErr  bool
+	}{
+		{
+			name:     "2 decimals",
+			input:    123.45,
+			expected: 123.45,
+			wantErr:  false,
+		},
+		{
+			name:     "6 decimals",
+			input:    0.173915,
+			expected: 0.173915,
+			wantErr:  false,
+		},
+		{
+			name:     "int",
+			input:    73,
+			expected: 73.0,
+			wantErr:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var f FloatOrString
+			b, errMarshal := json.Marshal(tt.input)
+			assert.NoError(t, errMarshal)
+			err := json.Unmarshal(b, &f)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.expected, f)
+			}
+		})
+	}
+}
+
+func TestMoney_UnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected Money
+		wantErr  bool
+	}{
+		{
+			name:  "string value",
+			input: `{"currency": "usd", "value": "0.1739150000000000000000000000"}`,
+			expected: Money{
+				Value:    0.173915,
+				Currency: "usd",
+			},
+			wantErr: false,
+		},
+		{
+			name:  "float64 value",
+			input: `{"currency": "usd", "value": 0.173915}`,
+			expected: Money{
+				Value:    0.173915,
+				Currency: "usd",
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var m Money
+			err := json.Unmarshal([]byte(tt.input), &m)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.expected, m)
+			}
+		})
+	}
+}
+
 func TestDeref(t *testing.T) {
 	tests := []struct {
 		name     string
