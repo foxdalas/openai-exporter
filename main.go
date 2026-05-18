@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,29 @@ func (s *StringOrBool) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 	return fmt.Errorf("unsupported type for StringOrBool: %s", string(b))
+}
+
+type FloatOrString float64
+
+func (f *FloatOrString) UnmarshalJSON(data []byte) error {
+	var floatVal float64
+	if err := json.Unmarshal(data, &floatVal); err == nil {
+		*f = FloatOrString(floatVal)
+		return nil
+	}
+
+	var strVal string
+	if err := json.Unmarshal(data, &strVal); err != nil {
+		return err
+	}
+
+	floatVal, err := strconv.ParseFloat(strVal, 64)
+	if err != nil {
+		return err
+	}
+
+	*f = FloatOrString(floatVal)
+	return nil
 }
 
 // Global Variables and State
@@ -173,8 +197,8 @@ type CostBucket struct {
 }
 
 type Money struct {
-	Value    float64 `json:"value"`
-	Currency string  `json:"currency"`
+	Value    FloatOrString `json:"value"`
+	Currency string        `json:"currency"`
 }
 
 type CostResult struct {
@@ -490,7 +514,7 @@ func (e *Exporter) fetchCostData(startTime, endTime int64) error {
 					"organization_id": res.OrganizationID,
 					"currency":        res.Amount.Currency,
 				}
-				dailyCostUSD.With(labels).Set(res.Amount.Value)
+				dailyCostUSD.With(labels).Set(float64(res.Amount.Value))
 				logrus.Debugf("Processed result - Date: %s, ProjectID: %s, ProjectName: %s, LineItem: %s, OrganizationID: %s, Cost: %f, Currency: %s",
 					date, projectId, e.ensureProjectName(projectId), lineName, res.OrganizationID, res.Amount.Value, res.Amount.Currency)
 			}
