@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +14,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// registerOnce ensures registerMetrics() runs at most once across the test
+// binary, since prometheus.MustRegister panics on duplicate registration.
+var registerOnce sync.Once
+
+func ensureMetricsRegistered() {
+	registerOnce.Do(registerMetrics)
+}
 
 func TestStringOrBool_UnmarshalJSON(t *testing.T) {
 	tests := []struct {
@@ -255,8 +265,8 @@ func TestMergeLabels(t *testing.T) {
 }
 
 func TestUpdateMetric(t *testing.T) {
+	ensureMetricsRegistered()
 	usageState = make(map[string]float64)
-	lastScrape = 0
 
 	labels := prometheus.Labels{
 		"model":        "gpt-4",
@@ -305,13 +315,13 @@ func TestNewExporter(t *testing.T) {
 		assert.Contains(t, err.Error(), "OPENAI_SECRET_KEY")
 	})
 
-	t.Run("missing OPENAI_ORG_ID", func(t *testing.T) {
+	t.Run("OPENAI_ORG_ID is optional", func(t *testing.T) {
 		t.Setenv("OPENAI_SECRET_KEY", "sk-test")
 		t.Setenv("OPENAI_ORG_ID", "")
 
-		_, err := NewExporter()
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "OPENAI_ORG_ID")
+		exporter, err := NewExporter()
+		require.NoError(t, err)
+		assert.Equal(t, "", exporter.orgHeader)
 	})
 
 	t.Run("valid environment", func(t *testing.T) {
@@ -323,22 +333,23 @@ func TestNewExporter(t *testing.T) {
 		assert.NotNil(t, exporter)
 		assert.NotNil(t, exporter.client)
 		assert.Equal(t, "sk-test", exporter.apiKey)
-		assert.Equal(t, "org-123", exporter.orgID)
+		assert.Equal(t, "org-123", exporter.orgHeader)
 	})
 }
 
 func TestEnsureProjectName(t *testing.T) {
 	projectNames = make(map[string]string)
+	ctx := context.Background()
 
 	t.Run("empty project id", func(t *testing.T) {
 		e := &Exporter{apiKey: "test"}
-		result := e.ensureProjectName("")
+		result := e.ensureProjectName(ctx, "")
 		assert.Equal(t, "unknown", result)
 	})
 
 	t.Run("unknown project id", func(t *testing.T) {
 		e := &Exporter{apiKey: "test"}
-		result := e.ensureProjectName("unknown")
+		result := e.ensureProjectName(ctx, "unknown")
 		assert.Equal(t, "unknown", result)
 	})
 
@@ -347,11 +358,11 @@ func TestEnsureProjectName(t *testing.T) {
 		projectNames["proj-123"] = "cached-project"
 
 		e := &Exporter{apiKey: "test"}
-		result := e.ensureProjectName("proj-123")
+		result := e.ensureProjectName(ctx, "proj-123")
 		assert.Equal(t, "cached-project", result)
 	})
 
-	t.Run("fetch project name from API", func(t *testing.T) {
+	t.Run("fetch project name from API (parsing only)", func(t *testing.T) {
 		projectNames = make(map[string]string)
 
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -384,23 +395,24 @@ func TestEnsureProjectName(t *testing.T) {
 			apiKey: "test-key",
 		}
 
-		result := e.ensureProjectName("proj-timeout")
+		result := e.ensureProjectName(ctx, "proj-timeout")
 		assert.Equal(t, "unknown", result)
 	})
 }
 
 func TestEnsureAPIKeyName(t *testing.T) {
 	apiKeyNames = make(map[string]string)
+	ctx := context.Background()
 
 	t.Run("empty api key id", func(t *testing.T) {
 		e := &Exporter{apiKey: "test"}
-		result := e.ensureAPIKeyName("proj-123", "")
+		result := e.ensureAPIKeyName(ctx, "proj-123", "")
 		assert.Equal(t, "unknown", result)
 	})
 
 	t.Run("unknown api key id", func(t *testing.T) {
 		e := &Exporter{apiKey: "test"}
-		result := e.ensureAPIKeyName("proj-123", "unknown")
+		result := e.ensureAPIKeyName(ctx, "proj-123", "unknown")
 		assert.Equal(t, "unknown", result)
 	})
 
@@ -409,7 +421,7 @@ func TestEnsureAPIKeyName(t *testing.T) {
 		apiKeyNames["key-123"] = "cached-key"
 
 		e := &Exporter{apiKey: "test"}
-		result := e.ensureAPIKeyName("proj-123", "key-123")
+		result := e.ensureAPIKeyName(ctx, "proj-123", "key-123")
 		assert.Equal(t, "cached-key", result)
 	})
 
@@ -445,12 +457,14 @@ func TestEnsureAPIKeyName(t *testing.T) {
 			apiKey: "test-key",
 		}
 
-		result := e.ensureAPIKeyName("proj-any", "key-timeout")
+		result := e.ensureAPIKeyName(ctx, "proj-any", "key-timeout")
 		assert.Equal(t, "unknown", result)
 	})
 }
 
 func TestFetchUsageData_ErrorCases(t *testing.T) {
+	ensureMetricsRegistered()
+	ctx := context.Background()
 	t.Run("HTTP request error", func(t *testing.T) {
 		e := &Exporter{
 			client: &http.Client{Timeout: 1 * time.Millisecond},
@@ -458,7 +472,7 @@ func TestFetchUsageData_ErrorCases(t *testing.T) {
 		}
 
 		endpoint := UsageEndpoint{Path: "completions", Name: "completions"}
-		err := e.fetchUsageData(endpoint, 1000, 2000)
+		err := e.fetchUsageData(ctx, endpoint, 1000, 2000)
 		assert.Error(t, err)
 	})
 
@@ -482,19 +496,21 @@ func TestFetchUsageData_ErrorCases(t *testing.T) {
 		}
 
 		endpoint := UsageEndpoint{Path: "completions", Name: "completions"}
-		err := e.fetchUsageData(endpoint, 1000, 2000)
+		err := e.fetchUsageData(ctx, endpoint, 1000, 2000)
 		assert.Error(t, err)
 	})
 }
 
 func TestFetchCostData_ErrorCases(t *testing.T) {
+	ensureMetricsRegistered()
+	ctx := context.Background()
 	t.Run("HTTP request error", func(t *testing.T) {
 		e := &Exporter{
 			client: &http.Client{Timeout: 1 * time.Millisecond},
 			apiKey: "test-key",
 		}
 
-		err := e.fetchCostData(1000, 2000)
+		err := e.fetchCostData(ctx, 1000, 2000)
 		assert.Error(t, err)
 	})
 
@@ -517,7 +533,7 @@ func TestFetchCostData_ErrorCases(t *testing.T) {
 			apiKey: "test-key",
 		}
 
-		err := e.fetchCostData(1000, 2000)
+		err := e.fetchCostData(ctx, 1000, 2000)
 		assert.Error(t, err)
 	})
 }

@@ -1,20 +1,27 @@
-name: "build-and-test"
-on: [push]
+name: build-and-test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: 'go.mod'
+          cache: true
 
       - name: Go mod download
         run: go mod download
 
-      - uses: Jerome1337/gofmt-action@v1.0.5
+      - name: gofmt
+        uses: Jerome1337/gofmt-action@v1.0.5
         with:
           gofmt-path: '.'
           gofmt-flags: '-l -d'
@@ -23,14 +30,7 @@ jobs:
         uses: golangci/golangci-lint-action@v9
 
       - name: Test
-        run: go test ./...
+        run: go test -race ./...
 
-      - name: Go build
-        run: go build .
-
-      - uses: meeDamian/sync-readme@v1.0.6
-        with:
-          user: ${{ secrets.DOCKERHUB_USERNAME }}
-          pass: ${{ secrets.DOCKERHUB_TOKEN }}
-          slug: foxdalas/openai-exporter
-          readme: ./README.md
+      - name: Build
+        run: go build ./...
