@@ -1,4 +1,4 @@
-FROM       alpine:3.23
+FROM       alpine:3.24
 MAINTAINER Maxim Pogozhiy <foxdalas@gmail.com>
 
 ARG TARGETARCH
